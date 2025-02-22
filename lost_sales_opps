@@ -1,0 +1,131 @@
+-- Step 1: Compute stock details for each product in the inventory
+WITH stock AS (
+  SELECT
+    u.product_id AS sku_id, -- Unique product identifier
+    u.supplier_name, -- Name of the supplier providing the product
+    u.warehouse_id, -- The warehouse where the stock is located
+    u.internal_quantity, -- Quantity of the product stored internally
+    p.category AS use_case_category, -- The category or classification of the product
+
+    -- Compute the average bundle size for stocked products
+    -- If no stocked units exist, default to 1 to prevent null values
+    COALESCE(
+      AVG(
+        CASE
+          WHEN u.stock_status = 'stocked' THEN u.bundle_size
+        END
+      ), 
+      1
+    ) AS bundle_size,
+
+    -- Retrieve the maximum product name value (ensures consistency when aggregating)
+    MAX(p.product_name) AS sku_name,
+    
+    -- Count the total number of distinct units delivered within the selected date range
+    COUNT_IF(
+      d.delivery_key IS NOT NULL
+      AND d.time_delivered BETWEEN CAST('{{ start_date }}' AS TIMESTAMP) 
+      AND CAST('{{ end_date }}' AS TIMESTAMP) + INTERVAL '1 day'
+    ) AS num_units_delivered,
+
+    -- Count the total number of unique orders packaged within the selected date range
+    COUNT_IF(
+      o.time_unit_packaged BETWEEN CAST('{{ start_date }}' AS TIMESTAMP) 
+      AND CAST('{{ end_date }}' AS TIMESTAMP)
+    ) AS num_orders
+
+  FROM inventory.units u
+  JOIN inventory.orders o ON u.unit_key = o.unit_key -- Join orders to retrieve order details
+  JOIN inventory.products p ON u.product_key = p.product_key -- Join products to fetch product metadata
+  LEFT JOIN logistics.deliveries d ON o.package_key = d.package_key -- Join deliveries to track delivered units
+
+  WHERE
+    d.time_delivered BETWEEN '{{ start_date }}' AND '{{ end_date }}' -- Filter based on selected date range
+    AND (use_case_category IN ({{ use_case_category }}) OR use_case_category IS NULL) -- Apply category filter
+
+  GROUP BY 1, 2, 3, 4, 5 -- Group by primary product attributes
+),
+
+-- Step 2: Compute stock levels, including in-stock and out-of-stock days
+stock_levels AS (
+  SELECT
+    ih.supplier_name, -- Supplier name for reference
+    ih.warehouse_id, -- Warehouse ID to track stock at different locations
+    ih.product_id AS sku_id, -- Unique product identifier
+    
+    -- Count the number of days stock was available (i.e., when total units > 0)
+    COUNT_IF(ih.total_units > 0) AS days_in_stock,
+
+    -- Compute the number of days a product was out of stock
+    -- This is calculated as the total days in the selected period minus the number of in-stock days
+    DATEDIFF(
+      DAY,
+      GREATEST(CAST('{{ start_date }}' AS DATE), sd.first_stock_date), -- Ensure stock tracking starts from the first recorded stock date
+      '{{ end_date }}'
+    ) - COUNT_IF(ih.total_units > 0) AS days_out_of_stock,
+
+    -- Capture the most recent stock date recorded for the product
+    sd.last_stock_date
+
+  FROM inventory.stock_history ih
+  LEFT JOIN (
+      -- Subquery to find the first and last recorded stock date for each product
+      SELECT
+          warehouse_id,
+          product_id,
+          supplier_name,
+          DATE_TRUNC('day', MIN(time_received)) AS first_stock_date, -- Earliest recorded stock date
+          DATE_TRUNC('day', MAX(time_received)) AS last_stock_date -- Most recent recorded stock date
+      FROM inventory.units
+      GROUP BY warehouse_id, product_id, supplier_name
+  ) sd 
+  ON sd.product_id = ih.product_id 
+  AND ih.warehouse_id = sd.warehouse_id 
+  AND ih.supplier_name = sd.supplier_name
+
+  WHERE ih.stock_date BETWEEN '{{ start_date }}' AND '{{ end_date }}' -- Apply date range filter
+  GROUP BY ih.warehouse_id, ih.product_id, ih.supplier_name, sd.first_stock_date, sd.last_stock_date
+  ORDER BY days_in_stock DESC, ih.warehouse_id, ih.product_id, supplier_name -- Sort by highest in-stock days
+),
+
+-- Step 3: Final output calculation combining stock and stock levels
+final_output AS (
+  SELECT
+    s.warehouse_id, -- Warehouse where the stock is located
+    w.warehouse_name, -- Human-readable name of the warehouse
+    w.country, -- Country where the warehouse is based
+    s.sku_id, -- Unique identifier for the product
+    s.sku_name, -- Product name for reference
+    s.use_case_category, -- The category or classification of the product
+    s.supplier_name, -- Name of the supplier
+    s.bundle_size, -- The standard packaging size of the product
+    s.internal_quantity, -- The quantity available internally
+    COALESCE(s.num_units_delivered, 0) AS num_units_delivered, -- Number of units delivered, default to 0 if null
+    
+    -- Calculate the average daily consumption rate of the product
+    -- This is computed as total delivered units divided by the number of in-stock days
+    COALESCE(
+      s.num_units_delivered / NULLIF(sl.days_in_stock, 0),
+      0
+    ) AS avg_daily_consumption,
+
+    sl.days_out_of_stock, -- Number of days the product was out of stock
+    sl.days_in_stock, -- Number of days the product was in stock
+
+    -- Estimate potential lost sales opportunities due to stockouts
+    -- This is calculated as the average daily consumption multiplied by the out-of-stock days
+    ROUND(avg_daily_consumption * sl.days_out_of_stock) AS missed_opportunities
+
+  FROM stock s
+  JOIN inventory.warehouses w ON s.warehouse_id = w.warehouse_id AND w.is_active = TRUE -- Ensure only active warehouses are considered
+  LEFT JOIN stock_levels sl ON s.sku_id = sl.sku_id
+    AND s.warehouse_id = sl.warehouse_id
+    AND s.supplier_name = sl.supplier_name
+)
+
+-- Step 4: Generate final report output
+SELECT *
+FROM final_output
+WHERE
+  days_out_of_stock IS NOT NULL -- Ensure only valid stock calculations are included
+ORDER BY sku_id, warehouse_id, supplier_name; -- Sort by SKU and warehouse for structured reporting
