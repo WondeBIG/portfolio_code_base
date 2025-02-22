@@ -1,0 +1,170 @@
+WITH all_deliveries AS (
+  -- Step 1: Extract delivery details with standardized region formatting and categorized product types
+  SELECT
+    d.country,
+    d.warehouse_name,
+    d.facility_locality AS district,
+
+    -- Standardizing region formatting for consistency
+    CASE
+      WHEN d.facility_region ILIKE '%Western North%' THEN 'Western North Region'
+      WHEN d.facility_region IS NOT NULL
+      AND d.facility_region NOT ILIKE '%region%' THEN CONCAT(TRIM(d.facility_region), ' Region')
+      ELSE TRIM(d.facility_region)
+    END AS region,
+
+    d.facility_name AS health_facility,
+    d.delivery_key,
+    d.order_key,
+    d.use_case_category,
+
+    -- Categorizing product types for easier analysis
+    CASE
+      WHEN LOWER(d.use_case_subcategory) IN ('hiv', 'tb', 'malaria', 'family planning') THEN 'Program Drugs'
+      WHEN d.use_case_category = 'Medical' THEN 'Essential Medicines'
+      WHEN d.use_case_category IN ('Vaccine', 'Vaccine Supplies') THEN 'Vaccines'
+      WHEN d.use_case_category = 'Blood' THEN 'Blood'
+      WHEN d.use_case_category = 'Animal Health' THEN 'Animal Health'
+      ELSE 'Other'
+    END AS category,
+
+    -- Further sub-categorization for detailed analysis
+    CASE
+      WHEN category = 'Vaccines' AND d.use_case_subcategory = 'Consumables' THEN 'Consumables'
+      WHEN category = 'Other' AND d.use_case_subcategory IS NULL THEN d.use_case_category
+      ELSE d.use_case_subcategory
+    END AS sub_category,
+
+    -- Creating a structured Category - Subcategory field
+    CASE
+      WHEN category = 'Other' AND d.use_case_subcategory IS NULL THEN 
+        CONCAT(category, ' - ', COALESCE(d.use_case_category, 'Null'))
+      WHEN d.use_case_subcategory IS NULL THEN 
+        CONCAT(category, ' - Null')
+      ELSE 
+        CONCAT(category, ' - ', sub_category)
+    END AS category_subcategory,
+
+    DATE(d.time_delivered_local) AS delivery_date, -- Standardized delivery date format
+    d.vaccine_doses,
+    d.units_delivered
+  FROM (
+    -- Step 2: Extract all units delivered with relevant metadata
+    WITH all_units_delivered AS (
+      SELECT
+        u.order_key,
+        del.delivery_key,
+        u.product_key,
+        u.unit_status,
+        p.expiration_date :: TIMESTAMP AS expiration_date,
+        COUNT(*) AS total_units,
+        total_units * p.subunits AS total_subunits,
+        p.bundle_size,
+        p.internal_quantity,
+        p.price,
+        SUM(p.vaccine_doses) AS vaccine_doses,
+        p.supplier,
+        p.restricted_facility_group_name,
+        p.lot_batch
+      FROM logistics.deliveries del
+      LEFT JOIN logistics.units u ON u.package_key = del.package_key
+      LEFT JOIN inventory.products p ON p.product_key = u.product_key
+      GROUP BY u.order_key, del.delivery_key, u.product_key, u.unit_status, 
+               p.expiration_date, p.bundle_size, p.subunits, 
+               p.internal_quantity, p.price, p.supplier, 
+               p.lot_batch, p.restricted_facility_group_name
+    )
+    -- Step 3: Join delivery data with orders and product metadata
+    SELECT
+      del.warehouse_id,
+      w.warehouse_name,
+      w.country,
+      aud.order_key,
+      o.source_system_order_id AS order_id,
+      o.time_order_created,
+      o.time_order_created_local,
+      del.time_order_confirmed,
+      del.time_order_confirmed_local,
+      del.time_scheduled,
+      del.time_scheduled_local,
+      del.shipment_priority,
+      o.order_priority_reasons,
+      aud.total_units / aud.bundle_size AS units_delivered,
+      aud.total_subunits AS subunits_delivered,
+      aud.internal_quantity,
+      
+      -- Handling vaccine doses separately if applicable
+      CASE
+        WHEN p.use_case_category = 'Vaccine' THEN COALESCE(aud.vaccine_doses, 1)
+        ELSE NULL
+      END AS vaccine_doses,
+
+      aud.price,
+      aud.unit_status,
+      aud.expiration_date,
+      aud.product_key,
+      p.product_id,
+      p.product_name,
+      p.vaccine_type,
+      aud.supplier,
+      aud.lot_batch,
+      aud.restricted_facility_group_name,
+
+      -- Standardized product categorization for consistency
+      CASE
+        WHEN LOWER(p.use_case_category) = 'consumable' THEN 'Consumables'
+        WHEN LOWER(p.use_case_category) IN ('m', 'medical', 'medicine') THEN 'Medical'
+        WHEN LOWER(p.use_case_category) = 'vaccine supplies' THEN 'Vaccine Supplies'
+        WHEN LOWER(p.use_case_category) = 'nutrition' THEN 'Nutrition'
+        WHEN LOWER(p.use_case_category) = 'family planning' THEN 'Family Planning'
+        ELSE p.use_case_category
+      END AS use_case_category,
+
+      -- Standardized product sub-categorization
+      CASE
+        WHEN LOWER(p.use_case_subcategory) = 'consumable' THEN 'Consumables'
+        ELSE p.use_case_subcategory
+      END AS use_case_subcategory,
+
+      p.storage_condition,
+      del.delivery_site_key,
+      ds.delivery_site_name,
+      ds.estimated_latitude AS latitude,
+      ds.estimated_longitude AS longitude,
+      del.facility_key,
+      f.facility_name,
+      f.facility_locality,
+      f.facility_region,
+      f.facility_type,
+      aud.delivery_key,
+      del.flight_id,
+      del.zip_number,
+      del.package_id,
+      del.package_type,
+      del.package_status,
+      del.time_delivered,
+      del.time_delivered_local
+    FROM all_units_delivered aud
+    LEFT JOIN logistics.orders o ON o.order_key = aud.order_key
+    LEFT JOIN inventory.products p ON p.product_key = aud.product_key
+    LEFT JOIN logistics.deliveries del ON del.delivery_key = aud.delivery_key
+    LEFT JOIN logistics.delivery_sites ds ON ds.delivery_site_key = del.delivery_site_key
+    LEFT JOIN healthcare.facilities f ON f.facility_key = del.facility_key
+    LEFT JOIN logistics.warehouses w ON w.warehouse_id = del.warehouse_id
+  ) AS d
+  WHERE d.country = 'GH'
+)
+
+-- Step 4: Final aggregation with geographic mapping
+SELECT
+  ad.*,
+  CONCAT('Q', DATE_PART('QUARTER', delivery_date), ' ', YEAR(delivery_date)) AS quarter, -- Assigning quarterly reporting
+  geo.latitude AS region_latitude,
+  geo.longitude AS region_longitude
+FROM all_deliveries ad
+LEFT JOIN reference.geographic_locations geo ON geo.region = ad.region
+WHERE (
+    use_case_category IN ({{ use_case }})
+    OR use_case_category IS NULL
+  )
+  AND delivery_date BETWEEN '{{ start_date }}' AND '{{ end_date }}';
