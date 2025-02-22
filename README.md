@@ -58,19 +58,11 @@ Purpose: Analyzes healthcare supply chain performance based on product categorie
 
 
 
-📌 How to Use These Queries
+## How to Use These Queries
 
-💡 1. Clone the repository & explore queries
-
-git clone https://github.com/your-github-username/supply-chain-analytics.git
-cd supply-chain-analytics
-
-💡 2. Open SQL queries and modify parameters (start_date, end_date, warehouse_id)
-Example:
-
-WHERE order_date BETWEEN '2023-01-01' AND '2023-12-31'
-
-💡 3. Run queries in your data warehouse (e.g., Snowflake, Redshift, BigQuery, PostgreSQL, etc.)
+* Clone the repository & explore queries
+* Open SQL queries and modify parameters (start_date, end_date, warehouse_id)
+* Run queries in your data warehouse (e.g., Snowflake, Redshift, BigQuery, PostgreSQL, etc.)
 
 ## Contributing & Feedback
 
@@ -78,5 +70,5 @@ WHERE order_date BETWEEN '2023-01-01' AND '2023-12-31'
 * Submit an issue or pull request via GitHub.
 * Fork & adapt the queries for your own projects.
 
-📧 Contact: osikaniian@gmail.com
+#### Contact: osikaniian@gmail.com
 
