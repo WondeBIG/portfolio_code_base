@@ -1,6 +1,6 @@
 
 #  Portfolio Repository for Optimized SQL Queries
-This repository contains generalized, high-performance SQL queries for analyzing logistics, supply chain operations, healthcare facility utilization, inventory management, and order fulfillment.
+
 
 ### Overview
 
