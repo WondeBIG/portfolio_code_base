@@ -1,0 +1,141 @@
+WITH LatestStatus AS (
+  -- Step 1: Retrieve the latest operational status of each health facility at the end of the month
+  SELECT
+    hs.facility_id, -- Unique identifier for the health facility
+    hs.warehouse_id, -- Warehouse or service area ID
+    hs.status_date, -- Date when the status was recorded
+    DATE_TRUNC(MONTH, hs.status_date) AS status_month, -- Extracts the month for aggregation
+    hf.warehouse_name, -- Name of the warehouse/service area
+    hf.service_point_name, -- Name of the associated service point
+    hf.facility_name, -- Facility name for reference
+    hf.facility_locality AS district, -- District where the facility is located
+    CONCAT(hf.facility_region, ' Region') AS region, -- Standardized region format
+    ROW_NUMBER() OVER (
+      PARTITION BY hs.facility_id, DATE_TRUNC(MONTH, hs.status_date)
+      ORDER BY hs.status_date DESC
+    ) AS rn -- Assigns row numbers to get the latest status for each facility within the month
+  FROM
+    healthcare.facility_status hs
+    INNER JOIN healthcare.facilities hf ON hs.facility_id = hf.facility_id
+  WHERE
+    hf.warehouse_name IS NOT NULL -- Ensures only named service areas are considered
+    AND hs.status IN ('Operational', 'Partially Suspended') -- Filters active or partially suspended facilities
+),
+
+HistoricalStatus AS (
+  -- Step 2: Assign historical status for facilities before October 2022
+  -- Facilities retain their October 26, 2022 status for all previous months
+  SELECT
+    hs.warehouse_id,
+    hs.facility_id,
+    hf.warehouse_name,
+    hf.service_point_name,
+    hf.facility_name,
+    hf.facility_locality AS district,
+    CONCAT(hf.facility_region, ' Region') AS region,
+    pfm.history_month -- Assigns past months to facility statuses
+  FROM
+    healthcare.facility_status hs
+    INNER JOIN healthcare.facilities hf ON hs.facility_id = hf.facility_id
+    CROSS JOIN (
+      -- Generate a list of distinct months from January 2019 to September 2022
+      SELECT DISTINCT DATE_TRUNC(MONTH, date_ref) AS history_month
+      FROM common.date_reference
+      WHERE history_month BETWEEN '2019-01-01' AND '2022-09-01'
+    ) pfm
+  WHERE
+    hs.status_date = '2022-10-26' -- Uses October 26, 2022 status for earlier months
+    AND hs.status IN ('Operational', 'Partially Suspended') -- Ensures only valid statuses are included
+),
+
+all_facilities AS (
+  -- Step 3: Consolidate current and historical health facility data
+  SELECT
+    facility_id,
+    warehouse_id,
+    status_month,
+    warehouse_name,
+    service_point_name,
+    facility_name AS district,
+    region
+  FROM
+    LatestStatus
+  WHERE
+    rn = 1 -- Selects only the latest status per month
+  UNION ALL
+  SELECT
+    facility_id,
+    warehouse_id,
+    history_month AS status_month,
+    warehouse_name,
+    service_point_name,
+    facility_name AS district,
+    region
+  FROM
+    HistoricalStatus
+),
+
+facility_monthly AS (
+  -- Step 4: Count active health facilities per month per service area
+  SELECT
+    status_month, -- Monthly aggregation
+    warehouse_id, -- Warehouse identifier
+    COUNT(DISTINCT facility_id) AS active_facilities -- Count of active facilities per warehouse
+  FROM
+    all_facilities
+  GROUP BY status_month, warehouse_id
+),
+
+all_orders AS (
+  -- Step 5: Capture all valid delivery orders (excluding canceled orders)
+  SELECT
+    DATE_TRUNC(MONTH, order_confirmed_time) AS order_month, -- Extract month from order confirmation timestamp
+    CONCAT('Q', DATE_PART('QUARTER', order_month), ' ', YEAR(order_month)) AS quarter, -- Assigns quarter label (e.g., Q1 2023)
+    warehouse_id,
+    warehouse_name,
+    facility_locality AS district,
+    
+    -- Standardizing region naming format
+    CASE
+      WHEN facility_region IS NOT NULL 
+      AND facility_region NOT ILIKE '%region%' 
+      THEN CONCAT(facility_region, ' Region')
+      ELSE facility_region
+    END AS region,
+
+    facility_name AS health_facility, -- Health facility name
+    country,
+    facility_id -- Unique identifier for health facility
+  FROM
+    logistics.orders_delivered
+  WHERE
+    country = 'GH' -- Only include data for Ghana
+    AND (use_case_category IN ({{ use_case }}) OR use_case_category IS NULL) -- Filter based on use-case category if specified
+    AND order_month BETWEEN '{{ start_date }}' AND '{{ end_date }}' -- Apply date range filter
+),
+
+orders_agg AS (
+  -- Step 6: Aggregate order counts per facility, month, and warehouse
+  SELECT
+    order_month, -- Monthly aggregation
+    quarter, -- Quarter for reporting
+    warehouse_id, -- Warehouse identifier
+    warehouse_name, -- Name of the warehouse
+    country, -- Country where the order was placed
+    COUNT(DISTINCT facility_id) AS ordered_facilities -- Count of facilities that placed orders
+  FROM
+    all_orders
+  GROUP BY order_month, quarter, warehouse_id, warehouse_name, country
+)
+
+-- Step 7: Generate final report by combining active facility data with order data
+SELECT
+  oa.*, -- Includes all fields from order aggregation
+  fm.active_facilities -- Number of active facilities per warehouse per month
+FROM
+  orders_agg oa
+  INNER JOIN facility_monthly fm 
+    ON fm.warehouse_id = oa.warehouse_id
+    AND oa.order_month = fm.status_month -- Ensure matching time periods
+WHERE
+  order_month IS NOT NULL;
